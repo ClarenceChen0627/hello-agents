@@ -7,7 +7,7 @@
     </div>
 
     <!-- 初始状态：居中输入卡片 -->
-    <div v-if="!isExpanded" class="layout layout-centered">
+    <div v-if="!isExpanded && !showHistory" class="layout layout-centered">
       <section class="panel panel-form panel-centered">
         <header class="panel-head">
           <div class="logo">
@@ -75,6 +75,15 @@
           </div>
         </form>
 
+        <div class="history-actions">
+          <button class="history-btn" type="button" @click="openHistory">
+            <svg viewBox="0 0 24 24" width="18" height="18">
+              <path d="M12 8v5l4 2M12 3a9 9 0 1 1 0 18 9 9 0 0 1 0-18Z" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round"/>
+            </svg>
+            查看历史记录
+          </button>
+        </div>
+
         <p v-if="error" class="error-chip">
           <svg viewBox="0 0 20 20" aria-hidden="true">
             <path
@@ -86,6 +95,58 @@
         <p v-else-if="loading" class="hint muted">
           正在收集线索与证据，实时进展见右侧区域。
         </p>
+      </section>
+    </div>
+
+    <!-- 历史记录视图 -->
+    <div v-if="!isExpanded && showHistory" class="layout layout-centered history-layout">
+      <section class="panel panel-history">
+        <header class="panel-head history-header">
+          <button class="back-btn" @click="closeHistory">
+            <svg viewBox="0 0 24 24" width="20" height="20">
+              <path d="M19 12H5M12 19l-7-7 7-7" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round"/>
+            </svg>
+            返回
+          </button>
+          <h2>📚 研究历史记录</h2>
+          <p>查看之前研究的主题和报告</p>
+        </header>
+
+        <div v-if="historyLoading" class="loading-state">
+          <div class="spinner-large"></div>
+          <p>正在加载历史记录...</p>
+        </div>
+
+        <div v-else-if="historyError" class="error-state">
+          <p class="error-message">{{ historyError }}</p>
+          <button class="retry-btn" @click="loadHistory">重试</button>
+        </div>
+
+        <div v-else-if="historyItems.length === 0" class="empty-state">
+          <svg viewBox="0 0 24 24" width="64" height="64" class="empty-icon">
+            <path d="M12 3v18M3 12h18" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round"/>
+          </svg>
+          <p>暂无历史记录</p>
+          <p class="empty-hint">开始你的第一次研究吧！</p>
+        </div>
+
+        <ul v-else class="history-list">
+          <li
+            v-for="item in historyItems"
+            :key="item.note_id"
+            class="history-item"
+            @click="viewHistoryDetail(item)"
+          >
+            <div class="history-item-content">
+              <h3 class="history-item-title">{{ item.title }}</h3>
+              <p class="history-item-date">{{ formatDate(item.created_at) }}</p>
+              <p class="history-item-path">{{ item.file_path }}</p>
+            </div>
+            <svg class="history-item-arrow" viewBox="0 0 24 24" width="20" height="20">
+              <path d="M9 18l6-6-6-6" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round"/>
+            </svg>
+          </li>
+        </ul>
       </section>
     </div>
 
@@ -329,6 +390,34 @@
           <h3>最终报告</h3>
           <pre class="block-pre">{{ reportMarkdown }}</pre>
         </div>
+
+        <!-- 历史记录详情视图 -->
+        <div v-if="viewingHistoryDetail" class="history-detail-view">
+          <header class="history-detail-header">
+            <button class="back-btn" @click="closeHistoryDetail">
+              <svg viewBox="0 0 24 24" width="20" height="20">
+                <path d="M19 12H5M12 19l-7-7 7-7" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round"/>
+              </svg>
+              返回列表
+            </button>
+            <h2>{{ currentHistoryDetail?.title || "研究详情" }}</h2>
+            <span class="history-detail-date">{{ formatDate(currentHistoryDetail?.created_at || '') }}</span>
+          </header>
+
+          <div v-if="historyDetailLoading" class="loading-state">
+            <div class="spinner-large"></div>
+            <p>正在加载研究详情...</p>
+          </div>
+
+          <div v-else-if="historyDetailError" class="error-state">
+            <p class="error-message">{{ historyDetailError }}</p>
+            <button class="retry-btn" @click="loadHistoryDetail">重试</button>
+          </div>
+
+          <div v-else-if="currentHistoryDetail" class="history-detail-content">
+            <div class="markdown-rendered" v-html="renderMarkdown(currentHistoryDetail.content)"></div>
+          </div>
+        </div>
       </section>
 
     </div>
@@ -340,7 +429,11 @@ import { computed, onBeforeUnmount, reactive, ref } from "vue";
 
 import {
   runResearchStream,
-  type ResearchStreamEvent
+  getResearchHistory,
+  getResearchDetail,
+  type ResearchStreamEvent,
+  type HistoryItem,
+  type ResearchDetailResponse
 } from "./services/api";
 
 interface SourceItem {
@@ -386,6 +479,16 @@ const error = ref("");
 const progressLogs = ref<string[]>([]);
 const logsCollapsed = ref(false);
 const isExpanded = ref(false);
+
+// History-related state
+const showHistory = ref(false);
+const historyItems = ref<HistoryItem[]>([]);
+const historyLoading = ref(false);
+const historyError = ref("");
+const viewingHistoryDetail = ref(false);
+const historyDetailLoading = ref(false);
+const historyDetailError = ref("");
+const currentHistoryDetail = ref<ResearchDetailResponse | null>(null);
 
 const todoTasks = ref<TodoTaskView[]>([]);
 const activeTaskId = ref<number | null>(null);
@@ -981,6 +1084,96 @@ const startNewResearch = () => {
   isExpanded.value = false;
   form.topic = "";
   form.searchApi = "";
+};
+
+// History-related functions
+const openHistory = async () => {
+  showHistory.value = true;
+  await loadHistory();
+};
+
+const closeHistory = () => {
+  showHistory.value = false;
+  viewingHistoryDetail.value = false;
+};
+
+const loadHistory = async () => {
+  historyLoading.value = true;
+  historyError.value = "";
+  try {
+    const response = await getResearchHistory();
+    historyItems.value = response.items;
+  } catch (err) {
+    historyError.value = err instanceof Error ? err.message : "加载历史记录失败";
+  } finally {
+    historyLoading.value = false;
+  }
+};
+
+const viewHistoryDetail = async (item: HistoryItem) => {
+  viewingHistoryDetail.value = true;
+  currentHistoryDetail.value = null;
+  historyDetailError.value = "";
+  historyDetailLoading.value = true;
+  try {
+    currentHistoryDetail.value = await getResearchDetail(item.note_id);
+  } catch (err) {
+    historyDetailError.value = err instanceof Error ? err.message : "加载研究详情失败";
+  } finally {
+    historyDetailLoading.value = false;
+  }
+};
+
+const closeHistoryDetail = () => {
+  viewingHistoryDetail.value = false;
+  currentHistoryDetail.value = null;
+};
+
+const formatDate = (isoString: string): string => {
+  if (!isoString) return "";
+  const date = new Date(isoString);
+  return date.toLocaleString("zh-CN", {
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit"
+  });
+};
+
+// Simple markdown renderer for the report
+const renderMarkdown = (content: string): string => {
+  if (!content) return "";
+
+  // Escape HTML
+  let html = content
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
+
+  // Headers
+  html = html.replace(/^#### (.*$)/gim, "<h4>$1</h4>");
+  html = html.replace(/^### (.*$)/gim, "<h3>$1</h3>");
+  html = html.replace(/^## (.*$)/gim, "<h2>$1</h2>");
+  html = html.replace(/^# (.*$)/gim, "<h1>$1</h1>");
+
+  // Bold
+  html = html.replace(/\*\*(.*?)\*\*/g, "<strong>$1</strong>");
+
+  // Italic
+  html = html.replace(/\*(.*?)\*/g, "<em>$1</em>");
+
+  // Links
+  html = html.replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>');
+
+  // Unordered lists
+  html = html.replace(/^\s*[-*+]\s+(.*$)/gim, "<li>$1</li>");
+  html = html.replace(/(<li>.*<\/li>\n?)+/g, "<ul>$&</ul>");
+
+  // Line breaks
+  html = html.replace(/\n/g, "<br>");
+
+  return html;
 };
 
 onBeforeUnmount(() => {
@@ -2299,6 +2492,336 @@ select:focus {
 
   .layout-fullscreen .panel-result {
     height: 60vh;
+  }
+}
+
+/* History-related styles */
+.history-actions {
+  margin-top: 16px;
+  display: flex;
+  justify-content: center;
+}
+
+.history-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 12px 20px;
+  background: rgba(148, 163, 184, 0.15);
+  border: 1px solid rgba(148, 163, 184, 0.3);
+  border-radius: 14px;
+  color: #475569;
+  font-size: 14px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: all 0.2s ease;
+}
+
+.history-btn:hover {
+  background: rgba(148, 163, 184, 0.25);
+  border-color: rgba(148, 163, 184, 0.45);
+  color: #1e293b;
+}
+
+.history-layout {
+  max-width: 800px !important;
+}
+
+.panel-history {
+  width: 100%;
+  max-width: 800px;
+  min-height: 500px;
+}
+
+.history-header {
+  text-align: center;
+  padding-bottom: 24px;
+  border-bottom: 1px solid rgba(148, 163, 184, 0.2);
+}
+
+.history-header h2 {
+  margin: 12px 0 8px;
+  font-size: 24px;
+  color: #1f2937;
+}
+
+.history-header p {
+  color: #64748b;
+  font-size: 14px;
+}
+
+.history-header .back-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 14px;
+  background: rgba(148, 163, 184, 0.12);
+  border: 1px solid rgba(148, 163, 184, 0.25);
+  border-radius: 10px;
+  color: #475569;
+  font-size: 14px;
+  cursor: pointer;
+  transition: all 0.2s ease;
+}
+
+.history-header .back-btn:hover {
+  background: rgba(148, 163, 184, 0.2);
+  color: #1e293b;
+}
+
+.loading-state,
+.error-state,
+.empty-state {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  padding: 48px 24px;
+  text-align: center;
+}
+
+.spinner-large {
+  width: 48px;
+  height: 48px;
+  border: 4px solid rgba(59, 130, 246, 0.2);
+  border-top-color: #3b82f6;
+  border-radius: 50%;
+  animation: spin 1s linear infinite;
+  margin-bottom: 16px;
+}
+
+.error-message {
+  color: #dc2626;
+  font-size: 15px;
+  margin-bottom: 16px;
+}
+
+.retry-btn {
+  padding: 10px 20px;
+  background: linear-gradient(135deg, #3b82f6, #8b5cf6);
+  border: none;
+  border-radius: 12px;
+  color: white;
+  font-size: 14px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.2s ease;
+}
+
+.retry-btn:hover {
+  transform: translateY(-2px);
+  box-shadow: 0 6px 20px rgba(59, 130, 246, 0.4);
+}
+
+.empty-icon {
+  color: #cbd5e1;
+  margin-bottom: 16px;
+}
+
+.empty-state p {
+  color: #64748b;
+  font-size: 16px;
+  margin: 4px 0;
+}
+
+.empty-hint {
+  color: #94a3b8 !important;
+  font-size: 14px !important;
+}
+
+.history-list {
+  list-style: none;
+  padding: 0;
+  margin: 24px 0 0;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  max-height: 420px;
+  overflow-y: auto;
+}
+
+.history-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 16px 18px;
+  background: rgba(255, 255, 255, 0.8);
+  border: 1px solid rgba(148, 163, 184, 0.2);
+  border-radius: 14px;
+  cursor: pointer;
+  transition: all 0.2s ease;
+}
+
+.history-item:hover {
+  background: rgba(248, 250, 252, 0.95);
+  border-color: rgba(59, 130, 246, 0.35);
+  box-shadow: 0 4px 12px rgba(59, 130, 246, 0.1);
+}
+
+.history-item-content {
+  flex: 1;
+  min-width: 0;
+}
+
+.history-item-title {
+  margin: 0 0 6px;
+  font-size: 16px;
+  font-weight: 600;
+  color: #1f2937;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.history-item-date {
+  margin: 0 0 4px;
+  font-size: 13px;
+  color: #64748b;
+}
+
+.history-item-path {
+  margin: 0;
+  font-size: 12px;
+  color: #94a3b8;
+  font-family: monospace;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.history-item-arrow {
+  color: #94a3b8;
+  flex-shrink: 0;
+  margin-left: 16px;
+  transition: transform 0.2s ease;
+}
+
+.history-item:hover .history-item-arrow {
+  color: #3b82f6;
+  transform: translateX(4px);
+}
+
+/* History detail view */
+.history-detail-view {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  overflow-y: auto;
+}
+
+.history-detail-header {
+  padding: 16px 20px;
+  border-bottom: 1px solid rgba(148, 163, 184, 0.2);
+  background: rgba(255, 255, 255, 0.95);
+  position: sticky;
+  top: 0;
+  z-index: 10;
+}
+
+.history-detail-header .back-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 14px;
+  background: rgba(148, 163, 184, 0.12);
+  border: 1px solid rgba(148, 163, 184, 0.25);
+  border-radius: 10px;
+  color: #475569;
+  font-size: 14px;
+  cursor: pointer;
+  transition: all 0.2s ease;
+  margin-bottom: 12px;
+}
+
+.history-detail-header .back-btn:hover {
+  background: rgba(148, 163, 184, 0.2);
+  color: #1e293b;
+}
+
+.history-detail-header h2 {
+  margin: 0 0 8px;
+  font-size: 20px;
+  color: #1f2937;
+}
+
+.history-detail-date {
+  font-size: 13px;
+  color: #64748b;
+}
+
+.history-detail-content {
+  padding: 24px;
+  flex: 1;
+}
+
+.markdown-rendered {
+  font-size: 15px;
+  line-height: 1.7;
+  color: #1f2937;
+}
+
+.markdown-rendered h1 {
+  font-size: 28px;
+  font-weight: 700;
+  margin: 24px 0 16px;
+  color: #0f172a;
+  border-bottom: 2px solid rgba(59, 130, 246, 0.3);
+  padding-bottom: 8px;
+}
+
+.markdown-rendered h2 {
+  font-size: 22px;
+  font-weight: 600;
+  margin: 20px 0 12px;
+  color: #1f2937;
+}
+
+.markdown-rendered h3 {
+  font-size: 18px;
+  font-weight: 600;
+  margin: 16px 0 10px;
+  color: #374151;
+}
+
+.markdown-rendered h4 {
+  font-size: 16px;
+  font-weight: 600;
+  margin: 14px 0 8px;
+  color: #4b5563;
+}
+
+.markdown-rendered strong {
+  font-weight: 600;
+  color: #111827;
+}
+
+.markdown-rendered a {
+  color: #2563eb;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+.markdown-rendered a:hover {
+  color: #1d4ed8;
+}
+
+.markdown-rendered ul {
+  margin: 12px 0;
+  padding-left: 24px;
+}
+
+.markdown-rendered li {
+  margin: 6px 0;
+  line-height: 1.6;
+}
+
+.markdown-rendered br {
+  line-height: 1.6;
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
   }
 }
 </style>

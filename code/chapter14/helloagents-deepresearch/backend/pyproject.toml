@@ -1,5 +1,6 @@
 [project]
-name = "helloagents-deep-researcher"
+# 包名采用Python规范（横杠换下划线，方便后续导入）
+name = "helloagents_deepresearch"
 version = "0.0.1"
 description = "Fully local web research and summarization assistant powered by HelloAgents."
 authors = [
@@ -10,7 +11,7 @@ license = { text = "MIT" }
 requires-python = ">=3.10"
 dependencies = [
     "fastapi>=0.115.0",
-    "hello-agents==0.2.9",
+    "hello-agents>=0.2.8",
     "tavily-python>=0.5.0",
     "python-dotenv==1.0.1",
     "requests>=2.31.0",
@@ -18,22 +19,27 @@ dependencies = [
     "uvicorn[standard]>=0.32.0",
     "ddgs>=9.6.1",
     "loguru>=0.7.3",
+    "huggingface_hub>=0.20.0"
 ]
 
 [project.optional-dependencies]
 dev = ["mypy>=1.11.1", "ruff>=0.6.1"]
 
 [build-system]
-requires = ["setuptools>=73.0.0", "wheel"]
+# 指定稳定版本，避免兼容性问题
+requires = ["setuptools>=77.0.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
+# 直接包含src包（对应当前目录结构，会自动包含其子包services）
 packages = ["src"]
 
 [tool.setuptools.package-dir]
-"" = "src"
+# 映射：将包名helloagents_deepresearch对应到src目录（既符合项目名，又适配目录）
+"helloagents_deepresearch" = "src"
 
 [tool.setuptools.package-data]
+# 包含src下所有py.typed文件（若有），保留原有配置
 "*" = ["py.typed"]
 
 [tool.ruff]

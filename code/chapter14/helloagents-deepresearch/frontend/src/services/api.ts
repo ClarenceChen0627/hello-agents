@@ -15,6 +15,25 @@ export interface StreamOptions {
   signal?: AbortSignal;
 }
 
+export interface HistoryItem {
+  note_id: string;
+  title: string;
+  created_at: string;
+  file_path: string;
+}
+
+export interface HistoryResponse {
+  items: HistoryItem[];
+}
+
+export interface ResearchDetailResponse {
+  note_id: string;
+  title: string;
+  content: string;
+  created_at: string;
+  file_path: string;
+}
+
 export async function runResearchStream(
   payload: ResearchRequest,
   onEvent: (event: ResearchStreamEvent) => void,
@@ -93,4 +112,23 @@ export async function runResearchStream(
       break;
     }
   }
+}
+
+export async function getResearchHistory(): Promise<HistoryResponse> {
+  const response = await fetch(`${baseURL}/research/history`);
+  if (!response.ok) {
+    throw new Error(`获取历史记录失败：${response.status}`);
+  }
+  return response.json();
+}
+
+export async function getResearchDetail(noteId: string): Promise<ResearchDetailResponse> {
+  const response = await fetch(`${baseURL}/research/history/${noteId}`);
+  if (!response.ok) {
+    if (response.status === 404) {
+      throw new Error(`研究记录 "${noteId}" 不存在`);
+    }
+    throw new Error(`获取研究详情失败：${response.status}`);
+  }
+  return response.json();
 }

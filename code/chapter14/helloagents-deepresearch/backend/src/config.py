@@ -1,8 +1,11 @@
 import os
+from dotenv import load_dotenv
 from enum import Enum
 from typing import Any, Optional
 
 from pydantic import BaseModel, Field
+
+load_dotenv()
 
 
 class SearchAPI(Enum):
