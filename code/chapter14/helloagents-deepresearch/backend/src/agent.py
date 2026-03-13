@@ -542,7 +542,23 @@ class DeepResearchAgent:
             note_id = self._extract_note_id_from_text(response)
 
         if not note_id:
-            return None
+            session_id = f"session_{datetime.utcnow().strftime('%Y%m%d_%H%M%S_%f')}"
+            state.report_note_id = session_id
+            state.report_note_path = None
+            self._session_store.upsert_session(
+                self._build_session_snapshot(
+                    state,
+                    report=report.strip(),
+                    note_id=session_id,
+                    note_path=None,
+                )
+            )
+            return {
+                "type": "report_note",
+                "note_id": session_id,
+                "title": note_title,
+                "content": content,
+            }
 
         state.report_note_id = note_id
         if self.config.notes_workspace:
