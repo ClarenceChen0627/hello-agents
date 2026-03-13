@@ -99,7 +99,7 @@
     </div>
 
     <!-- 历史记录视图 -->
-    <div v-if="!isExpanded && showHistory" class="layout layout-centered history-layout">
+    <div v-else-if="!isExpanded && showHistory" class="layout layout-centered history-layout">
       <section class="panel panel-history">
         <header class="panel-head history-header">
           <button class="back-btn" @click="closeHistory">
@@ -489,6 +489,7 @@ const viewingHistoryDetail = ref(false);
 const historyDetailLoading = ref(false);
 const historyDetailError = ref("");
 const currentHistoryDetail = ref<ResearchDetailResponse | null>(null);
+const expandedMode = ref<"live" | "history" | null>(null);
 
 const todoTasks = ref<TodoTaskView[]>([]);
 const activeTaskId = ref<number | null>(null);
@@ -746,6 +747,152 @@ function resetWorkflowState() {
   logsCollapsed.value = false;
 }
 
+function parseToolCalls(value: unknown): ToolCallLog[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+
+  return value
+    .map((item, index) => {
+      const payload = ensureRecord(item);
+      const eventId =
+        typeof payload.event_id === "number"
+          ? payload.event_id
+          : typeof payload.eventId === "number"
+          ? payload.eventId
+          : index + 1;
+
+      return {
+        eventId,
+        agent:
+          typeof payload.agent === "string" && payload.agent.trim()
+            ? payload.agent.trim()
+            : "Agent",
+        tool:
+          typeof payload.tool === "string" && payload.tool.trim()
+            ? payload.tool.trim()
+            : "tool",
+        parameters: ensureRecord(payload.parameters),
+        result: typeof payload.result === "string" ? payload.result : "",
+        noteId: extractOptionalString(payload.note_id ?? payload.noteId),
+        notePath: extractOptionalString(payload.note_path ?? payload.notePath),
+        timestamp: Date.now() + index
+      } satisfies ToolCallLog;
+    })
+    .filter(Boolean);
+}
+
+function createTaskView(
+  item: Record<string, unknown>,
+  index: number,
+  fallbackTopic: string
+): TodoTaskView {
+  const rawId =
+    typeof item.id === "number"
+      ? item.id
+      : typeof item.id === "string"
+      ? Number(item.id)
+      : index + 1;
+  const id = Number.isFinite(rawId) ? Number(rawId) : index + 1;
+  const noteId =
+    typeof item.note_id === "string" && item.note_id.trim()
+      ? item.note_id.trim()
+      : null;
+  const notePath =
+    typeof item.note_path === "string" && item.note_path.trim()
+      ? item.note_path.trim()
+      : null;
+  const sourcesSummary =
+    typeof item.sources_summary === "string" ? item.sources_summary.trim() : "";
+  const summary = typeof item.summary === "string" ? item.summary.trim() : "";
+  const notices = Array.isArray(item.notices)
+    ? item.notices.filter((value): value is string => typeof value === "string")
+    : [];
+
+  return {
+    id,
+    title:
+      typeof item.title === "string" && item.title.trim()
+        ? item.title.trim()
+        : `任务${id}`,
+    intent:
+      typeof item.intent === "string" && item.intent.trim()
+        ? item.intent.trim()
+        : "探索与主题相关的关键信息",
+    query:
+      typeof item.query === "string" && item.query.trim()
+        ? item.query.trim()
+        : fallbackTopic,
+    status:
+      typeof item.status === "string" && item.status.trim()
+        ? item.status.trim()
+        : "pending",
+    summary,
+    sourcesSummary,
+    sourceItems: parseSources(sourcesSummary),
+    notices,
+    noteId,
+    notePath,
+    toolCalls: parseToolCalls(item.tool_calls)
+  };
+}
+
+function loadHistoryResult(detail: ResearchDetailResponse) {
+  const topic = detail.research_topic?.trim() || detail.title?.trim() || "";
+  resetWorkflowState();
+  loading.value = false;
+  error.value = "";
+  viewingHistoryDetail.value = false;
+  historyDetailError.value = "";
+  historyDetailLoading.value = false;
+  currentHistoryDetail.value = detail;
+  form.topic = topic;
+  form.searchApi = detail.search_api?.trim() || "";
+  expandedMode.value = "history";
+  isExpanded.value = true;
+  showHistory.value = false;
+
+  const historyEvents = Array.isArray(detail.events) ? detail.events : [];
+  if (historyEvents.length) {
+    for (const event of historyEvents) {
+      consumeResearchEvent(event);
+    }
+    if (!reportMarkdown.value) {
+      reportMarkdown.value =
+        detail.report_markdown?.trim() || detail.content?.trim() || "";
+    }
+    if (activeTaskId.value === null && todoTasks.value.length) {
+      activeTaskId.value = todoTasks.value[0].id;
+    }
+    return;
+  }
+
+  todoTasks.value = Array.isArray(detail.tasks)
+    ? detail.tasks.map((item, index) =>
+        createTaskView(item as Record<string, unknown>, index, topic)
+      )
+    : [];
+
+  activeTaskId.value = todoTasks.value.length ? todoTasks.value[0].id : null;
+  reportMarkdown.value =
+    detail.report_markdown?.trim() || detail.content?.trim() || "";
+
+  const logs: string[] = [];
+  if (topic) {
+    logs.push(`已载入历史研究：${topic}`);
+  }
+  if (todoTasks.value.length) {
+    logs.push(`已恢复 ${todoTasks.value.length} 个子任务`);
+  }
+  if (reportMarkdown.value) {
+    logs.push("已载入最终报告");
+  }
+  if (detail.created_at) {
+    logs.push(`记录时间：${formatDate(detail.created_at)}`);
+  }
+  progressLogs.value = logs;
+}
+
 function findTask(taskId: unknown): TodoTaskView | undefined {
   const numeric =
     typeof taskId === "number"
@@ -771,6 +918,202 @@ function upsertTaskMetadata(task: TodoTaskView, payload: Record<string, unknown>
   }
 }
 
+function consumeResearchEvent(event: ResearchStreamEvent) {
+  if (event.type === "status") {
+    const message =
+      typeof event.message === "string" && event.message.trim()
+        ? event.message
+        : "流程状态更新";
+    progressLogs.value.push(message);
+
+    const payload = event as Record<string, unknown>;
+    const task = findTask(payload.task_id);
+    if (task && message) {
+      task.notices.push(message);
+      applyNoteMetadata(task, payload);
+    }
+    return;
+  }
+
+  if (event.type === "todo_list") {
+    const tasks = Array.isArray(event.tasks)
+      ? (event.tasks as Record<string, unknown>[])
+      : [];
+
+    todoTasks.value = tasks.map((item, index) =>
+      createTaskView(item, index, form.topic.trim())
+    );
+
+    if (todoTasks.value.length) {
+      activeTaskId.value = todoTasks.value[0].id;
+      progressLogs.value.push("已生成任务清单");
+    } else {
+      progressLogs.value.push("未生成任务清单，使用默认任务继续");
+    }
+    return;
+  }
+
+  if (event.type === "task_status") {
+    const payload = event as Record<string, unknown>;
+    const task = findTask(event.task_id);
+    if (!task) {
+      return;
+    }
+
+    upsertTaskMetadata(task, payload);
+    applyNoteMetadata(task, payload);
+    const status =
+      typeof event.status === "string" && event.status.trim()
+        ? event.status.trim()
+        : task.status;
+    task.status = status;
+
+    if (status === "in_progress") {
+      task.summary = "";
+      task.sourcesSummary = "";
+      task.sourceItems = [];
+      task.notices = [];
+      activeTaskId.value = task.id;
+      progressLogs.value.push(`开始执行任务：${task.title}`);
+    } else if (status === "completed") {
+      if (typeof event.summary === "string" && event.summary.trim()) {
+        task.summary = event.summary.trim();
+      }
+      if (
+        typeof event.sources_summary === "string" &&
+        event.sources_summary.trim()
+      ) {
+        task.sourcesSummary = event.sources_summary.trim();
+        task.sourceItems = parseSources(task.sourcesSummary);
+      }
+      progressLogs.value.push(`完成任务：${task.title}`);
+      if (activeTaskId.value === task.id) {
+        pulse(summaryHighlight);
+        pulse(sourcesHighlight);
+      }
+    } else if (status === "skipped") {
+      progressLogs.value.push(`任务跳过：${task.title}`);
+    }
+    return;
+  }
+
+  if (event.type === "sources") {
+    const payload = event as Record<string, unknown>;
+    const task = findTask(event.task_id);
+    if (!task) {
+      return;
+    }
+
+    const textCandidates = [
+      payload.latest_sources,
+      payload.sources_summary,
+      payload.raw_context
+    ];
+    const latestText = textCandidates
+      .map((value) => (typeof value === "string" ? value.trim() : ""))
+      .find((value) => value);
+
+    if (latestText) {
+      task.sourcesSummary = latestText;
+      task.sourceItems = parseSources(latestText);
+      if (activeTaskId.value === task.id) {
+        pulse(sourcesHighlight);
+      }
+      progressLogs.value.push(`已更新任务来源：${task.title}`);
+    }
+
+    if (typeof payload.backend === "string") {
+      progressLogs.value.push(`当前使用搜索后端：${payload.backend}`);
+    }
+
+    applyNoteMetadata(task, payload);
+    return;
+  }
+
+  if (event.type === "task_summary_chunk") {
+    const payload = event as Record<string, unknown>;
+    const task = findTask(event.task_id);
+    if (!task) {
+      return;
+    }
+    const chunk = typeof event.content === "string" ? event.content : "";
+    task.summary += chunk;
+    applyNoteMetadata(task, payload);
+    if (activeTaskId.value === task.id) {
+      pulse(summaryHighlight);
+    }
+    return;
+  }
+
+  if (event.type === "tool_call") {
+    const payload = event as Record<string, unknown>;
+    const eventId =
+      typeof payload.event_id === "number" ? payload.event_id : Date.now();
+    const agent =
+      typeof payload.agent === "string" && payload.agent.trim()
+        ? payload.agent.trim()
+        : "Agent";
+    const tool =
+      typeof payload.tool === "string" && payload.tool.trim()
+        ? payload.tool.trim()
+        : "tool";
+    const parameters = ensureRecord(payload.parameters);
+    const result = typeof payload.result === "string" ? payload.result : "";
+    const noteId = extractOptionalString(payload.note_id);
+    const notePath = extractOptionalString(payload.note_path);
+
+    const task = findTask(payload.task_id);
+    if (task) {
+      task.toolCalls.push({
+        eventId,
+        agent,
+        tool,
+        parameters,
+        result,
+        noteId,
+        notePath,
+        timestamp: Date.now()
+      });
+      if (noteId) {
+        task.noteId = noteId;
+      }
+      if (notePath) {
+        task.notePath = notePath;
+      }
+      const logSummary = noteId
+        ? `${agent} 调用了 ${tool}（任务 ${task.id}，笔记 ${noteId}）`
+        : `${agent} 调用了 ${tool}（任务 ${task.id}）`;
+      progressLogs.value.push(logSummary);
+      if (activeTaskId.value === task.id) {
+        pulse(toolHighlight);
+      }
+    } else {
+      progressLogs.value.push(`${agent} 调用了 ${tool}`);
+    }
+    return;
+  }
+
+  if (event.type === "final_report") {
+    const report =
+      typeof event.report === "string" && event.report.trim()
+        ? event.report.trim()
+        : "";
+    reportMarkdown.value = report || "报告生成失败，未获得有效内容";
+    pulse(reportHighlight);
+    progressLogs.value.push("最终报告已生成");
+    return;
+  }
+
+  if (event.type === "error") {
+    const detail =
+      typeof event.detail === "string" && event.detail.trim()
+        ? event.detail
+        : "研究过程中发生错误";
+    error.value = detail;
+    progressLogs.value.push("研究失败，已停止流程");
+  }
+}
+
 const handleSubmit = async () => {
   if (!form.topic.trim()) {
     error.value = "请输入研究主题";
@@ -785,6 +1128,8 @@ const handleSubmit = async () => {
   loading.value = true;
   error.value = "";
   isExpanded.value = true;
+  showHistory.value = false;
+  expandedMode.value = "live";
   resetWorkflowState();
 
   const controller = new AbortController();
@@ -799,6 +1144,10 @@ const handleSubmit = async () => {
     await runResearchStream(
       payload,
       (event: ResearchStreamEvent) => {
+        consumeResearchEvent(event);
+        return;
+        /*
+
         if (event.type === "status") {
           const message =
             typeof event.message === "string" && event.message.trim()
@@ -1040,6 +1389,7 @@ const handleSubmit = async () => {
           error.value = detail;
           progressLogs.value.push("研究失败，已停止流程");
         }
+        */
       },
       { signal: controller.signal }
     );
@@ -1073,7 +1423,15 @@ const goBack = () => {
   if (loading.value) {
     return; // 研究进行中不允许返回
   }
+  if (expandedMode.value === "history") {
+    resetWorkflowState();
+    isExpanded.value = false;
+    showHistory.value = true;
+    expandedMode.value = null;
+    return;
+  }
   isExpanded.value = false;
+  expandedMode.value = null;
 };
 
 const startNewResearch = () => {
@@ -1082,19 +1440,24 @@ const startNewResearch = () => {
   }
   resetWorkflowState();
   isExpanded.value = false;
+  showHistory.value = false;
+  expandedMode.value = null;
   form.topic = "";
   form.searchApi = "";
 };
 
 // History-related functions
 const openHistory = async () => {
+  resetWorkflowState();
+  isExpanded.value = false;
   showHistory.value = true;
+  expandedMode.value = null;
   await loadHistory();
 };
 
 const closeHistory = () => {
   showHistory.value = false;
-  viewingHistoryDetail.value = false;
+  expandedMode.value = null;
 };
 
 const loadHistory = async () => {
@@ -1102,7 +1465,10 @@ const loadHistory = async () => {
   historyError.value = "";
   try {
     const response = await getResearchHistory();
-    historyItems.value = response.items;
+    historyItems.value = response.items.filter((item) => {
+      const title = item.title.trim();
+      return !/^任务\s*\d+/i.test(title) && !/^task\s*\d+/i.test(title);
+    });
   } catch (err) {
     historyError.value = err instanceof Error ? err.message : "加载历史记录失败";
   } finally {
@@ -1111,22 +1477,37 @@ const loadHistory = async () => {
 };
 
 const viewHistoryDetail = async (item: HistoryItem) => {
-  viewingHistoryDetail.value = true;
-  currentHistoryDetail.value = null;
-  historyDetailError.value = "";
-  historyDetailLoading.value = true;
+  historyLoading.value = true;
+  historyError.value = "";
   try {
-    currentHistoryDetail.value = await getResearchDetail(item.note_id);
+    const detail = await getResearchDetail(item.note_id);
+    loadHistoryResult(detail);
   } catch (err) {
     historyDetailError.value = err instanceof Error ? err.message : "加载研究详情失败";
   } finally {
     historyDetailLoading.value = false;
+    if (historyDetailError.value) {
+      historyError.value = historyDetailError.value;
+    }
+    historyLoading.value = false;
   }
 };
 
 const closeHistoryDetail = () => {
   viewingHistoryDetail.value = false;
   currentHistoryDetail.value = null;
+};
+
+const loadHistoryDetail = async () => {
+  if (!currentHistoryDetail.value?.note_id) {
+    return;
+  }
+  await viewHistoryDetail({
+    note_id: currentHistoryDetail.value.note_id,
+    title: currentHistoryDetail.value.title,
+    created_at: currentHistoryDetail.value.created_at,
+    file_path: currentHistoryDetail.value.file_path
+  });
 };
 
 const formatDate = (isoString: string): string => {
@@ -1263,6 +1644,7 @@ onBeforeUnmount(() => {
   max-width: 100%;
   gap: 0;
   align-items: stretch;
+  background: radial-gradient(circle at 50% 0%, #f8fafc 0%, #e2e8f0 60%, #cbd5e1 100%);
 }
 
 .panel {
@@ -1270,10 +1652,10 @@ onBeforeUnmount(() => {
   flex: 1 1 360px;
   padding: 24px;
   border-radius: 20px;
-  background: rgba(255, 255, 255, 0.95);
-  border: 1px solid rgba(148, 163, 184, 0.18);
-  box-shadow: 0 24px 48px rgba(15, 23, 42, 0.12);
-  backdrop-filter: blur(8px);
+  background: rgba(255, 255, 255, 0.85);
+  border: 1px solid rgba(148, 163, 184, 0.15);
+  box-shadow: 0 24px 48px rgba(15, 23, 42, 0.08);
+  backdrop-filter: blur(12px);
   overflow: hidden;
 }
 
@@ -1499,53 +1881,53 @@ select:focus {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 12px;
-  flex-wrap: wrap;
+  gap: 10px;
+  padding: 8px 4px 12px;
 }
 
 .status-main {
   display: flex;
   align-items: center;
-  gap: 12px;
+  gap: 10px;
   flex-wrap: wrap;
 }
 
 .status-controls {
   display: flex;
-  gap: 8px;
+  gap: 6px;
 }
 
 .status-chip {
   display: inline-flex;
   align-items: center;
-  gap: 8px;
-  background: rgba(191, 219, 254, 0.28);
-  padding: 8px 14px;
+  gap: 6px;
+  background: rgba(59, 130, 246, 0.12);
+  padding: 6px 12px;
   border-radius: 999px;
-  font-size: 13px;
-  color: #1f2937;
-  border: 1px solid rgba(59, 130, 246, 0.35);
-  transition: background 0.3s ease, color 0.3s ease;
+  font-size: 12px;
+  color: #1e293b;
+  border: 1px solid rgba(59, 130, 246, 0.25);
+  transition: background 0.2s ease, color 0.2s ease;
 }
 
 .status-chip.active {
-  background: rgba(129, 140, 248, 0.2);
-  border-color: rgba(129, 140, 248, 0.4);
+  background: rgba(129, 140, 248, 0.15);
+  border-color: rgba(129, 140, 248, 0.35);
   color: #1e293b;
 }
 
 .status-chip .dot {
-  width: 8px;
-  height: 8px;
+  width: 6px;
+  height: 6px;
   border-radius: 999px;
   background: #2563eb;
-  box-shadow: 0 0 12px rgba(37, 99, 235, 0.45);
+  box-shadow: 0 0 8px rgba(37, 99, 235, 0.4);
   animation: pulse 1.8s ease-in-out infinite;
 }
 
 .status-meta {
   color: #64748b;
-  font-size: 13px;
+  font-size: 12px;
 }
 
 .timeline-wrapper {
@@ -1628,33 +2010,36 @@ select:focus {
 
 .tasks-section {
   display: grid;
-  grid-template-columns: 280px 1fr;
-  gap: 20px;
+  grid-template-columns: 240px 1fr;
+  gap: 16px;
   align-items: start;
+  height: calc(100vh - 70px);
 }
 
 @media (max-width: 960px) {
   .tasks-section {
     grid-template-columns: 1fr;
+    height: auto;
   }
 }
 
 .tasks-list {
-  background: rgba(255, 255, 255, 0.92);
-  border: 1px solid rgba(148, 163, 184, 0.26);
-  border-radius: 18px;
-  padding: 18px;
+  background: rgba(255, 255, 255, 0.7);
+  border: 1px solid rgba(148, 163, 184, 0.12);
+  border-radius: 14px;
+  padding: 14px;
   display: flex;
   flex-direction: column;
-  gap: 16px;
-  box-shadow: inset 0 0 0 1px rgba(226, 232, 240, 0.4);
+  gap: 12px;
+  overflow-y: auto;
+  max-height: calc(100vh - 90px);
 }
 
 .tasks-list h3 {
   margin: 0;
-  font-size: 16px;
+  font-size: 13px;
   font-weight: 600;
-  color: #1f2937;
+  color: #475569;
 }
 
 .tasks-list ul {
@@ -1663,23 +2048,23 @@ select:focus {
   padding: 0;
   display: flex;
   flex-direction: column;
-  gap: 12px;
+  gap: 8px;
 }
 
 .task-item {
-  border-radius: 14px;
+  border-radius: 10px;
   border: 1px solid transparent;
-  transition: border-color 0.2s ease, background 0.2s ease;
+  transition: all 0.2s ease;
 }
 
 .task-item.completed {
-  border-color: rgba(56, 189, 248, 0.35);
-  background: rgba(191, 219, 254, 0.28);
+  border-color: rgba(56, 189, 248, 0.3);
+  background: rgba(191, 219, 254, 0.15);
 }
 
 .task-item.active {
-  border-color: rgba(129, 140, 248, 0.5);
-  background: rgba(224, 231, 255, 0.5);
+  border-color: rgba(59, 130, 246, 0.5);
+  background: rgba(219, 234, 254, 0.4);
 }
 
 .task-button {
@@ -1687,8 +2072,8 @@ select:focus {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 12px;
-  padding: 12px 14px 6px;
+  gap: 10px;
+  padding: 8px 12px 4px;
   background: transparent;
   border: none;
   color: inherit;
@@ -1698,7 +2083,7 @@ select:focus {
 
 .task-title {
   font-weight: 600;
-  font-size: 14px;
+  font-size: 13px;
   color: #1e293b;
 }
 
@@ -1706,12 +2091,12 @@ select:focus {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  padding: 4px 10px;
+  padding: 3px 8px;
   border-radius: 999px;
-  font-size: 12px;
+  font-size: 11px;
   font-weight: 500;
   color: #1f2937;
-  background: rgba(148, 163, 184, 0.2);
+  background: rgba(148, 163, 184, 0.18);
 }
 
 .task-status.pending {
@@ -1736,8 +2121,8 @@ select:focus {
 
 .task-intent {
   margin: 0;
-  padding: 0 14px 12px 14px;
-  font-size: 13px;
+  padding: 0 12px 8px 12px;
+  font-size: 12px;
   color: #64748b;
 }
 
@@ -2315,30 +2700,30 @@ select:focus {
 
 /* 侧边栏样式 */
 .sidebar {
-  width: 400px;
-  min-width: 400px;
+  width: 360px;
+  min-width: 320px;
   height: 100vh;
-  background: rgba(255, 255, 255, 0.98);
-  border-right: 1px solid rgba(148, 163, 184, 0.2);
-  padding: 32px 24px;
+  background: linear-gradient(180deg, rgba(59, 130, 246, 0.08) 0%, rgba(255, 255, 255, 0.02) 30%, transparent 100%);
+  border-right: 1px solid rgba(148, 163, 184, 0.15);
+  padding: 28px 20px;
   display: flex;
   flex-direction: column;
-  gap: 24px;
+  gap: 20px;
   overflow-y: auto;
-  box-shadow: 4px 0 24px rgba(15, 23, 42, 0.08);
 }
 
 .sidebar-header {
   display: flex;
   flex-direction: column;
-  gap: 16px;
+  gap: 8px;
 }
 
 .sidebar-header h2 {
-  font-size: 24px;
-  font-weight: 700;
+  font-size: 18px;
+  font-weight: 600;
   margin: 0;
-  color: #1f2937;
+  color: #0f172a;
+  letter-spacing: -0.02em;
 }
 
 .back-btn {
@@ -2372,57 +2757,58 @@ select:focus {
   flex: 1;
   display: flex;
   flex-direction: column;
-  gap: 20px;
+  gap: 16px;
+  padding: 0 8px;
 }
 
 .info-item {
   display: flex;
   flex-direction: column;
-  gap: 8px;
+  gap: 6px;
 }
 
 .info-item label {
-  font-size: 12px;
+  font-size: 11px;
   font-weight: 600;
   text-transform: uppercase;
-  letter-spacing: 0.5px;
+  letter-spacing: 0.3px;
   color: #64748b;
 }
 
 .info-item p {
   margin: 0;
-  font-size: 14px;
-  color: #1f2937;
-  line-height: 1.6;
+  font-size: 13px;
+  color: #334155;
+  line-height: 1.5;
 }
 
 .topic-display {
-  font-size: 16px !important;
-  font-weight: 600;
+  font-size: 14px !important;
+  font-weight: 500 !important;
   color: #0f172a !important;
-  padding: 12px;
-  background: rgba(59, 130, 246, 0.05);
+  padding: 10px 12px;
+  background: rgba(59, 130, 246, 0.08);
   border-radius: 8px;
   border-left: 3px solid #3b82f6;
 }
 
 .progress-bar {
   width: 100%;
-  height: 8px;
+  height: 6px;
   background: rgba(148, 163, 184, 0.2);
-  border-radius: 4px;
+  border-radius: 3px;
   overflow: hidden;
 }
 
 .progress-fill {
   height: 100%;
   background: linear-gradient(90deg, #3b82f6, #8b5cf6);
-  border-radius: 4px;
+  border-radius: 3px;
   transition: width 0.5s ease;
 }
 
 .progress-text {
-  font-size: 13px !important;
+  font-size: 12px !important;
   color: #64748b !important;
   font-weight: 500;
 }
@@ -2430,9 +2816,9 @@ select:focus {
 .sidebar-actions {
   display: flex;
   flex-direction: column;
-  gap: 12px;
-  padding-top: 16px;
-  border-top: 1px solid rgba(148, 163, 184, 0.2);
+  gap: 10px;
+  padding-top: 12px;
+  border-top: 1px solid rgba(148, 163, 184, 0.1);
 }
 
 .new-research-btn {
@@ -2440,21 +2826,21 @@ select:focus {
   align-items: center;
   justify-content: center;
   gap: 8px;
-  padding: 14px 20px;
-  background: linear-gradient(135deg, #3b82f6, #8b5cf6);
+  padding: 12px 16px;
+  background: linear-gradient(135deg, #2563eb, #4f46e5);
   border: none;
-  border-radius: 12px;
+  border-radius: 10px;
   color: white;
-  font-size: 15px;
+  font-size: 14px;
   font-weight: 600;
   cursor: pointer;
-  transition: all 0.3s ease;
-  box-shadow: 0 4px 12px rgba(59, 130, 246, 0.3);
+  transition: all 0.2s ease;
+  box-shadow: 0 2px 8px rgba(37, 99, 235, 0.2);
 }
 
 .new-research-btn:hover {
-  transform: translateY(-2px);
-  box-shadow: 0 6px 20px rgba(59, 130, 246, 0.4);
+  transform: translateY(-1px);
+  box-shadow: 0 4px 12px rgba(37, 99, 235, 0.25);
 }
 
 .new-research-btn:active {
@@ -2469,12 +2855,14 @@ select:focus {
   border: none;
   overflow-y: auto;
   max-width: none;
+  background: rgba(255, 255, 255, 0.7);
+  backdrop-filter: blur(12px);
 }
 
 @media (max-width: 1024px) {
   .sidebar {
-    width: 320px;
-    min-width: 320px;
+    width: 280px;
+    min-width: 260px;
   }
 }
 
@@ -2487,11 +2875,13 @@ select:focus {
     width: 100%;
     min-width: 100%;
     height: auto;
-    max-height: 40vh;
+    max-height: 35vh;
+    border-right: none;
+    border-bottom: 1px solid rgba(148, 163, 184, 0.15);
   }
 
   .layout-fullscreen .panel-result {
-    height: 60vh;
+    height: 65vh;
   }
 }
 

@@ -2,7 +2,7 @@
 
 import operator
 from dataclasses import dataclass, field
-from typing import List, Optional
+from typing import Any, List, Optional
 
 from typing_extensions import Annotated
 
@@ -30,6 +30,7 @@ class SummaryState:
     search_query: str = field(default=None)  # Deprecated placeholder
     web_research_results: Annotated[list, operator.add] = field(default_factory=list)
     sources_gathered: Annotated[list, operator.add] = field(default_factory=list)
+    stream_events: list[dict[str, Any]] = field(default_factory=list)
     research_loop_count: int = field(default=0)  # Research loop count
     running_summary: str = field(default=None)  # Legacy summary field
     todo_items: Annotated[list, operator.add] = field(default_factory=list)

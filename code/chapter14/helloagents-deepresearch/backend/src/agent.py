@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import re
 from pathlib import Path
@@ -27,6 +28,9 @@ from services.summarizer import SummarizationService
 from services.tool_events import ToolCallTracker
 
 logger = logging.getLogger(__name__)
+
+SESSION_STATE_START = "<!-- DEEP_RESEARCH_SESSION_START -->"
+SESSION_STATE_END = "<!-- DEEP_RESEARCH_SESSION_END -->"
 
 
 class DeepResearchAgent:
@@ -151,11 +155,20 @@ class DeepResearchAgent:
         """Execute the workflow yielding incremental progress events."""
         state = SummaryState(research_topic=topic)
         logger.debug("Starting streaming research: topic=%s", topic)
+
+        def emit(event: dict[str, Any]) -> Iterator[dict[str, Any]]:
+            self._record_stream_event(state, event)
+            yield event
         yield {"type": "status", "message": "初始化研究流程"}
+
+        self._record_stream_event(
+            state,
+            {"type": "status", "message": "Initializing research workflow"},
+        )
 
         state.todo_items = self.planner.plan_todo_list(state)
         for event in self._drain_tool_events(state, step=0):
-            yield event
+            yield from emit(event)
         if not state.todo_items:
             state.todo_items = [self.planner.create_fallback_task(state)]
 
@@ -165,11 +178,11 @@ class DeepResearchAgent:
             task.stream_token = token
             channel_map[task.id] = {"step": index, "token": token}
 
-        yield {
+        yield from emit({
             "type": "todo_list",
             "tasks": [self._serialize_task(t) for t in state.todo_items],
             "step": 0,
-        }
+        })
 
         event_queue: Queue[dict[str, Any]] = Queue()
 
@@ -250,7 +263,7 @@ class DeepResearchAgent:
                 if event.get("type") == "__task_done__":
                     finished_workers += 1
                     continue
-                yield event
+                yield from emit(event)
 
             while True:
                 try:
@@ -258,7 +271,7 @@ class DeepResearchAgent:
                 except Empty:
                     break
                 if event.get("type") != "__task_done__":
-                    yield event
+                    yield from emit(event)
         finally:
             self._set_tool_event_sink(None)
             for thread in threads:
@@ -267,21 +280,21 @@ class DeepResearchAgent:
         report = self.reporting.generate_report(state)
         final_step = len(state.todo_items) + 1
         for event in self._drain_tool_events(state, step=final_step):
-            yield event
+            yield from emit(event)
         state.structured_report = report
         state.running_summary = report
 
         note_event = self._persist_final_report(state, report)
         if note_event:
-            yield note_event
+            yield from emit(note_event)
 
-        yield {
+        yield from emit({
             "type": "final_report",
             "report": report,
             "note_id": state.report_note_id,
             "note_path": state.report_note_path,
-        }
-        yield {"type": "done"}
+        })
+        yield from emit({"type": "done"})
 
     # ------------------------------------------------------------------
     # Execution helpers
@@ -444,13 +457,43 @@ class DeepResearchAgent:
             "stream_token": task.stream_token,
         }
 
+    def _record_stream_event(self, state: SummaryState, event: dict[str, Any]) -> None:
+        """Store emitted events so history can reconstruct the full session view."""
+        state.stream_events.append(dict(event))
+
+    def _serialize_tool_calls_for_task(self, task_id: int) -> list[dict[str, Any]]:
+        """Build a history-safe snapshot of tool calls for a specific task."""
+        serialized: list[dict[str, Any]] = []
+        for event in self._tool_tracker.as_dicts():
+            if event.get("task_id") != task_id:
+                continue
+
+            note_id = event.get("note_id")
+            note_path = None
+            if note_id and self.config.notes_workspace:
+                note_path = str(Path(self.config.notes_workspace) / f"{note_id}.md")
+
+            serialized.append(
+                {
+                    "event_id": event.get("id"),
+                    "agent": event.get("agent"),
+                    "tool": event.get("tool"),
+                    "parameters": event.get("parsed_parameters") or {},
+                    "result": event.get("result") or "",
+                    "note_id": note_id,
+                    "note_path": note_path,
+                }
+            )
+
+        return serialized
+
     def _persist_final_report(self, state: SummaryState, report: str) -> dict[str, Any] | None:
         if not self.note_tool or not report or not report.strip():
             return None
 
         note_title = f"研究报告：{state.research_topic}".strip() or "研究报告"
         tags = ["deep_research", "report"]
-        content = report.strip()
+        content = self._build_report_note_content(state, report.strip())
 
         note_id = self._find_existing_report_note_id(state)
         response = ""
@@ -501,6 +544,53 @@ class DeepResearchAgent:
             payload["note_path"] = str(note_path)
 
         return payload
+
+    def _build_report_note_content(self, state: SummaryState, report: str) -> str:
+        session_payload = {
+            "session_version": 2,
+            "research_topic": state.research_topic,
+            "search_api": (
+                self.config.search_api.value
+                if hasattr(self.config.search_api, "value")
+                else str(self.config.search_api or "")
+            ),
+            "report_markdown": report,
+            "events": state.stream_events,
+            "tasks": [
+                {
+                    "id": task.id,
+                    "title": task.title,
+                    "intent": task.intent,
+                    "query": task.query,
+                    "status": task.status,
+                    "summary": task.summary,
+                    "sources_summary": task.sources_summary,
+                    "notices": task.notices,
+                    "note_id": task.note_id,
+                    "note_path": task.note_path,
+                    "tool_calls": self._serialize_tool_calls_for_task(task.id),
+                }
+                for task in state.todo_items
+            ],
+        }
+
+        topic = (state.research_topic or "鐮旂┒鎶ュ憡").replace("\n", " ").strip()
+        frontmatter = (
+            "---\n"
+            f"title: {topic}\n"
+            "note_type: conclusion\n"
+            f"research_topic: {topic}\n"
+            "---"
+        )
+        session_json = json.dumps(session_payload, ensure_ascii=False, indent=2)
+
+        return (
+            f"{frontmatter}\n"
+            f"{SESSION_STATE_START}\n"
+            f"{session_json}\n"
+            f"{SESSION_STATE_END}\n\n"
+            f"{report}"
+        )
 
     def _find_existing_report_note_id(self, state: SummaryState) -> str | None:
         if state.report_note_id:
