@@ -49,6 +49,11 @@ class Configuration(BaseModel):
         title="Notes Workspace",
         description="Directory for NoteTool to persist task notes",
     )
+    history_db_path: str = Field(
+        default="./history/deepresearch.sqlite3",
+        title="History Database Path",
+        description="SQLite database file used for session-level history storage",
+    )
     fetch_full_page: bool = Field(
         default=True,
         title="Fetch Full Page",
@@ -118,6 +123,7 @@ class Configuration(BaseModel):
             "search_api": os.getenv("SEARCH_API"),
             "enable_notes": os.getenv("ENABLE_NOTES"),
             "notes_workspace": os.getenv("NOTES_WORKSPACE"),
+            "history_db_path": os.getenv("HISTORY_DB_PATH"),
         }
 
         for key, value in env_aliases.items():

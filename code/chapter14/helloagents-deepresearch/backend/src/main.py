@@ -18,6 +18,7 @@ from pydantic import BaseModel, Field
 
 from config import Configuration, SearchAPI
 from agent import DeepResearchAgent
+from services.session_store import SqliteSessionStore
 
 SESSION_STATE_START = "<!-- DEEP_RESEARCH_SESSION_START -->"
 SESSION_STATE_END = "<!-- DEEP_RESEARCH_SESSION_END -->"
@@ -125,6 +126,12 @@ def _get_notes_dir() -> Path:
     if not notes_dir.is_absolute():
         notes_dir = Path.cwd() / notes_dir
     return notes_dir
+
+
+def _get_session_store() -> SqliteSessionStore:
+    """Get the SQLite-backed session history store."""
+    config = Configuration.from_env()
+    return SqliteSessionStore(config.history_db_path)
 
 
 def _parse_frontmatter(text: str) -> tuple[dict[str, str], str]:
@@ -310,6 +317,22 @@ def create_app() -> FastAPI:
     @app.get("/research/history")
     def get_research_history() -> HistoryResponse:
         """List all past research records from the notes workspace."""
+        store = _get_session_store()
+        session_items = store.list_sessions()
+        if session_items:
+            return HistoryResponse(
+                items=[
+                    HistoryItem(
+                        note_id=str(item.get("note_id") or item.get("session_id") or ""),
+                        title=str(item.get("research_topic") or ""),
+                        created_at=str(item.get("created_at") or ""),
+                        file_path=str(item.get("file_path") or ""),
+                    )
+                    for item in session_items
+                    if str(item.get("note_id") or item.get("session_id") or "").strip()
+                ]
+            )
+
         notes_dir = _get_notes_dir()
 
         if not notes_dir.exists():
@@ -356,6 +379,38 @@ def create_app() -> FastAPI:
     @app.get("/research/history/{note_id}")
     def get_research_detail(note_id: str) -> ResearchDetailResponse:
         """Get full details of a specific research record."""
+        store = _get_session_store()
+        session_payload = store.get_session(note_id)
+        if session_payload:
+            return ResearchDetailResponse(
+                note_id=str(session_payload.get("note_id") or note_id),
+                title=str(
+                    session_payload.get("research_topic")
+                    or session_payload.get("title")
+                    or note_id
+                ),
+                content=str(
+                    session_payload.get("content")
+                    or session_payload.get("report_markdown")
+                    or ""
+                ),
+                report_markdown=str(session_payload.get("report_markdown") or ""),
+                research_topic=str(session_payload.get("research_topic") or ""),
+                search_api=str(session_payload.get("search_api") or ""),
+                events=[
+                    item
+                    for item in (session_payload.get("events") or [])
+                    if isinstance(item, dict)
+                ],
+                tasks=[
+                    item
+                    for item in (session_payload.get("tasks") or [])
+                    if isinstance(item, dict)
+                ],
+                created_at=str(session_payload.get("created_at") or ""),
+                file_path=str(session_payload.get("file_path") or ""),
+            )
+
         notes_dir = _get_notes_dir()
         file_path = notes_dir / f"{note_id}.md"
 

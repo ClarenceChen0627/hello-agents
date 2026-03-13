@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+from datetime import datetime
 from pathlib import Path
 from queue import Empty, Queue
 from threading import Lock, Thread
@@ -24,6 +25,7 @@ from models import SummaryState, SummaryStateOutput, TodoItem
 from services.planner import PlanningService
 from services.reporter import ReportingService
 from services.search import dispatch_search, prepare_research_context
+from services.session_store import SqliteSessionStore
 from services.summarizer import SummarizationService
 from services.tool_events import ToolCallTracker
 
@@ -55,6 +57,7 @@ class DeepResearchAgent:
         self._tool_tracker = ToolCallTracker(
             self.config.notes_workspace if self.config.enable_notes else None
         )
+        self._session_store = SqliteSessionStore(self.config.history_db_path)
         self._tool_event_sink_enabled = False
         self._state_lock = Lock()
 
@@ -488,10 +491,24 @@ class DeepResearchAgent:
         return serialized
 
     def _persist_final_report(self, state: SummaryState, report: str) -> dict[str, Any] | None:
-        if not self.note_tool or not report or not report.strip():
+        if not report or not report.strip():
             return None
 
         note_title = f"研究报告：{state.research_topic}".strip() or "研究报告"
+        if not self.note_tool:
+            session_id = f"session_{datetime.utcnow().strftime('%Y%m%d_%H%M%S_%f')}"
+            state.report_note_id = session_id
+            state.report_note_path = None
+            self._session_store.upsert_session(
+                self._build_session_snapshot(
+                    state,
+                    report=report.strip(),
+                    note_id=session_id,
+                    note_path=None,
+                )
+            )
+            return None
+
         tags = ["deep_research", "report"]
         content = self._build_report_note_content(state, report.strip())
 
@@ -543,7 +560,58 @@ class DeepResearchAgent:
         if note_path:
             payload["note_path"] = str(note_path)
 
+        self._session_store.upsert_session(
+            self._build_session_snapshot(
+                state,
+                report=report.strip(),
+                note_id=note_id,
+                note_path=str(note_path) if note_path else None,
+            )
+        )
+
         return payload
+
+    def _build_session_snapshot(
+        self,
+        state: SummaryState,
+        *,
+        report: str,
+        note_id: str,
+        note_path: str | None,
+    ) -> dict[str, Any]:
+        timestamp = datetime.utcnow().isoformat()
+        return {
+            "session_version": 2,
+            "session_id": note_id,
+            "note_id": note_id,
+            "file_path": note_path or "",
+            "research_topic": state.research_topic,
+            "search_api": (
+                self.config.search_api.value
+                if hasattr(self.config.search_api, "value")
+                else str(self.config.search_api or "")
+            ),
+            "report_markdown": report,
+            "created_at": timestamp,
+            "updated_at": timestamp,
+            "events": state.stream_events,
+            "tasks": [
+                {
+                    "id": task.id,
+                    "title": task.title,
+                    "intent": task.intent,
+                    "query": task.query,
+                    "status": task.status,
+                    "summary": task.summary,
+                    "sources_summary": task.sources_summary,
+                    "notices": task.notices,
+                    "note_id": task.note_id,
+                    "note_path": task.note_path,
+                    "tool_calls": self._serialize_tool_calls_for_task(task.id),
+                }
+                for task in state.todo_items
+            ],
+        }
 
     def _build_report_note_content(self, state: SummaryState, report: str) -> str:
         session_payload = {
