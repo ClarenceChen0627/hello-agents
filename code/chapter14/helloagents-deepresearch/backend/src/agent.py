@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+from datetime import datetime
 from pathlib import Path
 from queue import Empty, Queue
 from threading import Lock, Thread
@@ -488,7 +489,7 @@ class DeepResearchAgent:
         return serialized
 
     def _persist_final_report(self, state: SummaryState, report: str) -> dict[str, Any] | None:
-        if not self.note_tool or not report or not report.strip():
+        if not report or not report.strip():
             return None
 
         note_title = f"研究报告：{state.research_topic}".strip() or "研究报告"
@@ -525,7 +526,7 @@ class DeepResearchAgent:
             note_id = self._extract_note_id_from_text(response)
 
         if not note_id:
-            return None
+            return self._persist_final_report_fallback(state, note_title, content)
 
         state.report_note_id = note_id
         if self.config.notes_workspace:
@@ -544,6 +545,37 @@ class DeepResearchAgent:
             payload["note_path"] = str(note_path)
 
         return payload
+
+    def _persist_final_report_fallback(
+        self,
+        state: SummaryState,
+        note_title: str,
+        content: str,
+    ) -> dict[str, Any] | None:
+        """Write a topic-level report note directly when NoteTool misses it."""
+        workspace = self.config.notes_workspace
+        if not workspace:
+            return None
+
+        notes_dir = Path(workspace)
+        if not notes_dir.is_absolute():
+            notes_dir = Path.cwd() / notes_dir
+        notes_dir.mkdir(parents=True, exist_ok=True)
+
+        note_id = state.report_note_id or f"report_{datetime.utcnow().strftime('%Y%m%d_%H%M%S_%f')}"
+        note_path = notes_dir / f"{note_id}.md"
+        note_path.write_text(content, encoding="utf-8")
+
+        state.report_note_id = note_id
+        state.report_note_path = str(note_path)
+
+        return {
+            "type": "report_note",
+            "note_id": note_id,
+            "title": note_title,
+            "content": content,
+            "note_path": str(note_path),
+        }
 
     def _build_report_note_content(self, state: SummaryState, report: str) -> str:
         session_payload = {
