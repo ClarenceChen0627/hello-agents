@@ -19,6 +19,9 @@ from pydantic import BaseModel, Field
 from config import Configuration, SearchAPI
 from agent import DeepResearchAgent
 
+SESSION_STATE_START = "<!-- DEEP_RESEARCH_SESSION_START -->"
+SESSION_STATE_END = "<!-- DEEP_RESEARCH_SESSION_END -->"
+
 # 添加控制台日志处理程序
 logger.add(
     sys.stderr,
@@ -80,6 +83,17 @@ class ResearchDetailResponse(BaseModel):
     note_id: str = Field(..., description="Unique note identifier")
     title: str = Field(..., description="Research topic/title")
     content: str = Field(..., description="Full markdown content of the report")
+    report_markdown: str = Field(..., description="Rendered report markdown")
+    research_topic: str = Field(..., description="Original research topic")
+    search_api: str = Field(default="", description="Search backend used for the session")
+    events: list[dict[str, Any]] = Field(
+        default_factory=list,
+        description="Recorded SSE event stream for reconstructing the session UI",
+    )
+    tasks: list[dict[str, Any]] = Field(
+        default_factory=list,
+        description="Structured task snapshots captured with the report",
+    )
     created_at: str = Field(..., description="ISO format timestamp")
     file_path: str = Field(..., description="Path to the note file")
 
@@ -113,6 +127,42 @@ def _get_notes_dir() -> Path:
     return notes_dir
 
 
+def _parse_frontmatter(text: str) -> tuple[dict[str, str], str]:
+    match = re.match(r"^---\s*\n(.*?)\n---\s*\n?", text, re.DOTALL)
+    if not match:
+        return {}, text
+
+    metadata: dict[str, str] = {}
+    for line in match.group(1).splitlines():
+        if ":" not in line:
+            continue
+        key, value = line.split(":", 1)
+        metadata[key.strip()] = value.strip()
+
+    return metadata, text[match.end() :]
+
+
+def _extract_session_payload(text: str) -> tuple[dict[str, Any] | None, str]:
+    pattern = re.compile(
+        rf"{re.escape(SESSION_STATE_START)}\s*(.*?)\s*{re.escape(SESSION_STATE_END)}\s*",
+        re.DOTALL,
+    )
+    match = pattern.search(text)
+    if not match:
+        return None, text
+
+    payload: dict[str, Any] | None = None
+    try:
+        candidate = json.loads(match.group(1))
+        if isinstance(candidate, dict):
+            payload = candidate
+    except json.JSONDecodeError:
+        payload = None
+
+    body = f"{text[:match.start()]}{text[match.end():]}".strip()
+    return payload, body
+
+
 def _parse_note_file(file_path: Path) -> Optional[Dict[str, Any]]:
     """Parse a note file and extract metadata and content."""
     try:
@@ -121,22 +171,23 @@ def _parse_note_file(file_path: Path) -> Optional[Dict[str, Any]]:
         # Extract note_id from filename (without .md extension)
         note_id = file_path.stem
 
-        # Try to extract title from frontmatter or first heading
-        title = note_id
-        content_match = content
+        frontmatter, body = _parse_frontmatter(content)
+        session_payload, body = _extract_session_payload(body)
 
-        # Look for YAML frontmatter title
-        frontmatter_match = re.search(r'^---\s*\n(.*?)\n---\s*\n', content, re.DOTALL)
-        if frontmatter_match:
-            frontmatter = frontmatter_match.group(1)
-            title_match = re.search(r'^title:\s*(.+)$', frontmatter, re.MULTILINE)
-            if title_match:
-                title = title_match.group(1).strip()
-                content_match = content[frontmatter_match.end():]
+        # Try to extract title from structured metadata, frontmatter, or first heading
+        title = (
+            str(
+                (session_payload or {}).get("research_topic")
+                or frontmatter.get("research_topic")
+                or frontmatter.get("title")
+                or note_id
+            )
+            .strip()
+        )
+        note_type = str(frontmatter.get("note_type") or "").strip()
 
-        # If no frontmatter title, look for first heading
         if title == note_id:
-            heading_match = re.search(r'^#\s*(.+)$', content_match, re.MULTILINE)
+            heading_match = re.search(r"^#\s*(.+)$", body, re.MULTILINE)
             if heading_match:
                 title = heading_match.group(1).strip()
 
@@ -148,6 +199,9 @@ def _parse_note_file(file_path: Path) -> Optional[Dict[str, Any]]:
             "note_id": note_id,
             "title": title,
             "content": content,
+            "body": body.strip(),
+            "session_payload": session_payload or {},
+            "note_type": note_type,
             "created_at": created_at,
             "file_path": str(file_path),
         }
@@ -271,14 +325,22 @@ def create_app() -> FastAPI:
 
             # Check if this is a conclusion-type report by looking at content
             content = parsed["content"]
+            note_type = str(parsed.get("note_type") or "").strip()
+            session_payload = parsed.get("session_payload") or {}
+            if note_type == "task_state":
+                continue
             is_conclusion = (
+                note_type == "conclusion" or
+                bool(session_payload) and bool(session_payload.get("report_markdown")) or
                 "deep_research" in content and
                 "conclusion" in content or
                 "研究报告" in content or
                 "报告" in content
             )
 
-            # For now, include all note files (can be filtered later if needed)
+            if not is_conclusion:
+                continue
+
             history_items.append(HistoryItem(
                 note_id=parsed["note_id"],
                 title=parsed["title"],
@@ -307,7 +369,26 @@ def create_app() -> FastAPI:
         return ResearchDetailResponse(
             note_id=parsed["note_id"],
             title=parsed["title"],
-            content=parsed["content"],
+            content=parsed["body"],
+            report_markdown=str(
+                (parsed.get("session_payload") or {}).get("report_markdown")
+                or parsed["body"]
+            ),
+            research_topic=str(
+                (parsed.get("session_payload") or {}).get("research_topic")
+                or parsed["title"]
+            ),
+            search_api=str((parsed.get("session_payload") or {}).get("search_api") or ""),
+            events=[
+                item
+                for item in ((parsed.get("session_payload") or {}).get("events") or [])
+                if isinstance(item, dict)
+            ],
+            tasks=[
+                item
+                for item in ((parsed.get("session_payload") or {}).get("tasks") or [])
+                if isinstance(item, dict)
+            ],
             created_at=parsed["created_at"],
             file_path=parsed["file_path"],
         )

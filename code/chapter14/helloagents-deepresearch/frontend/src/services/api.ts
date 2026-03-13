@@ -30,6 +30,31 @@ export interface ResearchDetailResponse {
   note_id: string;
   title: string;
   content: string;
+  report_markdown: string;
+  research_topic: string;
+  search_api: string;
+  events: ResearchStreamEvent[];
+  tasks: Array<{
+    id: number;
+    title: string;
+    intent?: string;
+    query?: string;
+    status?: string;
+    summary?: string;
+    sources_summary?: string;
+    notices?: string[];
+    note_id?: string | null;
+    note_path?: string | null;
+    tool_calls?: Array<{
+      event_id?: number;
+      agent?: string;
+      tool?: string;
+      parameters?: Record<string, unknown>;
+      result?: string;
+      note_id?: string | null;
+      note_path?: string | null;
+    }>;
+  }>;
   created_at: string;
   file_path: string;
 }
